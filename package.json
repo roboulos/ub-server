@@ -1,0 +1,17 @@
+{
+  "name": "hp-base",
+  "version": "3.4.0",
+  "description": "Hosting Platform base image - Express server with Postgres, live route deployment, stored functions",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "pg": "^8.13.0",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "mongodb": "^6.12.0"
+  }
+}
