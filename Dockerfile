@@ -1,11 +1,15 @@
-FROM node:20-slim
-
+FROM node:20-slim AS builder
 WORKDIR /app
+COPY package.json tsconfig.json ./
+RUN npm install
+COPY src/ ./src/
+RUN npm run build
 
-COPY package.json ./
+FROM node:20-slim
+WORKDIR /app
+COPY --from=builder /app/package.json ./
 RUN npm install --production
-
-COPY server.js ./
+COPY --from=builder /app/dist/ ./
 
 # Routes directory for dynamic route loading
 RUN mkdir -p /app/routes
