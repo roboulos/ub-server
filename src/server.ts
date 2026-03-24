@@ -133,26 +133,48 @@ function loadRoutes(): void {
   Object.keys(require.cache).forEach(key => {
     if (key.startsWith(ROUTES_DIR)) delete require.cache[key];
   });
-  const newRouter = express.Router();
+
+  // Collect all route registrations before adding to router
+  const pending: Array<{ method: string; path: string; args: any[] }> = [];
+  const makeCollector = (method: string) => (routePath: string, ...args: any[]) => {
+    pending.push({ method, path: routePath, args });
+  };
+  const collector = {
+    get: makeCollector('get'),
+    post: makeCollector('post'),
+    put: makeCollector('put'),
+    patch: makeCollector('patch'),
+    delete: makeCollector('delete'),
+    locals: app.locals,
+  };
+
   const files = fs.readdirSync(ROUTES_DIR).filter((f: string) => f.endsWith('.js'));
   for (const file of files) {
     try {
       const route = require(path.join(ROUTES_DIR, file));
       if (typeof route === 'function') {
-        route({
-          ...app,
-          get: newRouter.get.bind(newRouter),
-          post: newRouter.post.bind(newRouter),
-          put: newRouter.put.bind(newRouter),
-          patch: newRouter.patch.bind(newRouter),
-          delete: newRouter.delete.bind(newRouter),
-          locals: app.locals,
-        });
+        route(collector);
         console.log(`[Routes] Loaded: ${file}`);
       }
     } catch (err: any) {
       console.error(`[Routes] Failed to load ${file}:`, err.message);
     }
+  }
+
+  // Sort: static routes before parameterized routes.
+  // Replace :param segments with ~ (ASCII 126, sorts after all alphanum)
+  // so /approval/list < /approval/~ (:id) — static wins.
+  pending.sort((a, b) => {
+    const keyA = a.path.replace(/:[^/]+/g, '~');
+    const keyB = b.path.replace(/:[^/]+/g, '~');
+    if (keyA < keyB) return -1;
+    if (keyA > keyB) return 1;
+    return 0;
+  });
+
+  const newRouter = express.Router();
+  for (const r of pending) {
+    (newRouter as any)[r.method](r.path, ...r.args);
   }
   dynamicRouter = newRouter;
 }
