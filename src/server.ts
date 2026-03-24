@@ -158,9 +158,17 @@ function loadRoutes(): void {
 }
 loadRoutes();
 
-app.post('/_reload', (req: Request, res: Response) => {
+app.post('/_reload', async (req: Request, res: Response) => {
+  if (pool) {
+    try {
+      const result = await syncRoutesFromDB();
+      return res.json({ success: true, message: 'Routes synced from database', ...result });
+    } catch (err: any) {
+      console.error('[Reload] DB sync failed, falling back to filesystem:', err.message);
+    }
+  }
   loadRoutes();
-  res.json({ success: true, message: 'Routes reloaded', routes: deployedRoutes.size });
+  res.json({ success: true, message: 'Routes reloaded from filesystem', routes: deployedRoutes.size });
 });
 
 // === Route Persistence ===
@@ -201,17 +209,26 @@ function compileTypeScript(code: string): string {
   return result.outputText;
 }
 
-function deployRoute(
+async function deployRoute(
   name: string,
   method: string,
   routePath: string,
   code: string,
   persist: boolean = true,
   language: 'js' | 'ts' = 'js'
-): void {
+): Promise<void> {
   const verb = method.toLowerCase();
   const fileName = `${name}.js`;
   const filePath = path.join(ROUTES_DIR, fileName);
+
+  // DB-first: persist before writing to filesystem
+  if (persist && pool) {
+    await pool.query(
+      `INSERT INTO _route_store (name, method, path, code, language) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (name) DO UPDATE SET method = $2, path = $3, code = $4, language = $5, deployed_at = NOW()`,
+      [name, verb.toUpperCase(), routePath, code, language]
+    );
+  }
 
   // Compile TS to JS if needed
   let compiledCode = code;
@@ -257,17 +274,10 @@ function deployRoute(
     language,
   });
 
-  if (persist && pool) {
-    pool.query(
-      `INSERT INTO _route_store (name, method, path, code, language) VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (name) DO UPDATE SET method = $2, path = $3, code = $4, language = $5, deployed_at = NOW()`,
-      [name, verb.toUpperCase(), routePath, code, language]
-    ).catch((err: Error) => console.error('[Routes] Failed to persist:', err.message));
-  }
   console.log(`[Deploy] ${verb.toUpperCase()} ${routePath} -> ${fileName} (${language})`);
 }
 
-app.post('/_deploy', (req: Request, res: Response) => {
+app.post('/_deploy', async (req: Request, res: Response) => {
   const { name, method, path: routePath, code, language } = req.body;
   if (!name || !routePath || !code) {
     return res.status(400).json({ error: 'name, path, and code are required' });
@@ -278,25 +288,41 @@ app.post('/_deploy', (req: Request, res: Response) => {
   }
   const lang: 'js' | 'ts' = language === 'ts' ? 'ts' : 'js';
   try {
-    deployRoute(name, verb.toUpperCase(), routePath, code, true, lang);
+    await deployRoute(name, verb.toUpperCase(), routePath, code, true, lang);
     res.json({ success: true, route: { name, method: verb.toUpperCase(), path: routePath, language: lang } });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/_undeploy', (req: Request, res: Response) => {
+app.post('/_undeploy', async (req: Request, res: Response) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: 'name is required' });
+
+  let dbDeleted = false;
+  let fileDeleted = false;
+
+  // DB-first: always clean the source of truth
+  if (pool) {
+    const result = await pool.query('DELETE FROM _route_store WHERE name = $1', [name]);
+    dbDeleted = (result.rowCount ?? 0) > 0;
+  }
+
+  // Then clean filesystem (best effort)
   const filePath = path.join(ROUTES_DIR, `${name}.js`);
   if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
-    deployedRoutes.delete(name);
-    loadRoutes();
-    if (pool) pool.query('DELETE FROM _route_store WHERE name = $1', [name]).catch(() => {});
-    res.json({ success: true, removed: name });
+    fileDeleted = true;
+  }
+
+  // Clean in-memory map
+  deployedRoutes.delete(name);
+  loadRoutes();
+
+  if (dbDeleted || fileDeleted) {
+    res.json({ success: true, removed: name, db: dbDeleted, file: fileDeleted });
   } else {
-    res.status(404).json({ error: 'Route not found' });
+    res.status(404).json({ error: 'Route not found in database or filesystem' });
   }
 });
 
@@ -343,6 +369,88 @@ app.get('/_routes/:name', (req: Request, res: Response) => {
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Route not found' });
     res.json({ name: routeName, source: fs.readFileSync(filePath, 'utf8') });
   }
+});
+
+// === Sync & Health ===
+
+async function syncRoutesFromDB(): Promise<{ synced: number; orphans_removed: number }> {
+  if (!pool) throw new Error('Database not configured');
+
+  const result = await pool.query('SELECT * FROM _route_store');
+  const dbRoutes = new Map<string, RouteStoreRow>();
+  for (const row of result.rows as RouteStoreRow[]) {
+    dbRoutes.set(row.name, row);
+  }
+
+  // Remove filesystem orphans (files not in DB)
+  let orphans_removed = 0;
+  if (fs.existsSync(ROUTES_DIR)) {
+    const files = fs.readdirSync(ROUTES_DIR).filter((f: string) => f.endsWith('.js'));
+    for (const file of files) {
+      const name = file.replace('.js', '');
+      if (!dbRoutes.has(name)) {
+        fs.unlinkSync(path.join(ROUTES_DIR, file));
+        console.log(`[Sync] Removed orphan: ${file}`);
+        orphans_removed++;
+      }
+    }
+  }
+
+  // Deploy all DB routes to filesystem + memory
+  deployedRoutes.clear();
+  for (const [name, row] of dbRoutes) {
+    await deployRoute(name, row.method, row.path, row.code, false, (row.language || 'js') as 'js' | 'ts');
+  }
+
+  console.log(`[Sync] Synced ${dbRoutes.size} routes, removed ${orphans_removed} orphans`);
+  return { synced: dbRoutes.size, orphans_removed };
+}
+
+app.post('/_sync', async (req: Request, res: Response) => {
+  if (!pool) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const result = await syncRoutesFromDB();
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/_health/routes', async (req: Request, res: Response) => {
+  const memoryNames = new Set(deployedRoutes.keys());
+  const filesystemNames = new Set<string>();
+  if (fs.existsSync(ROUTES_DIR)) {
+    for (const f of fs.readdirSync(ROUTES_DIR).filter((f: string) => f.endsWith('.js'))) {
+      filesystemNames.add(f.replace('.js', ''));
+    }
+  }
+  const dbNames = new Set<string>();
+  if (pool) {
+    try {
+      const result = await pool.query('SELECT name FROM _route_store');
+      for (const row of result.rows) dbNames.add(row.name);
+    } catch (err: any) {
+      return res.status(500).json({ error: `DB query failed: ${err.message}` });
+    }
+  }
+
+  // Compute drift
+  const allNames = new Set([...memoryNames, ...filesystemNames, ...dbNames]);
+  const drift: Array<{ name: string; memory: boolean; filesystem: boolean; database: boolean }> = [];
+  for (const name of allNames) {
+    const inMem = memoryNames.has(name);
+    const inFs = filesystemNames.has(name);
+    const inDb = dbNames.has(name);
+    if (!(inMem && inFs && inDb)) {
+      drift.push({ name, memory: inMem, filesystem: inFs, database: inDb });
+    }
+  }
+
+  res.json({
+    healthy: drift.length === 0,
+    counts: { memory: memoryNames.size, filesystem: filesystemNames.size, database: dbNames.size },
+    drift,
+  });
 });
 
 // === Daemons ===
@@ -470,7 +578,7 @@ app.get('/', (req: Request, res: Response) => {
         'GET /', 'GET /health', 'POST /sql',
         'POST /_deploy', 'POST /_undeploy',
         'GET /_routes', 'GET /_routes/:name',
-        'POST /_reload',
+        'POST /_reload', 'POST /_sync', 'GET /_health/routes',
         'POST /_functions', 'GET /_functions', 'GET /_functions/:name', 'DELETE /_functions/:name',
         'POST /_daemon/start', 'POST /_daemon/stop', 'GET /_daemon/list',
       ],
